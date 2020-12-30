@@ -21,7 +21,7 @@ use tokio_io::IoStream;
 
 use librespot::core::authentication::{get_credentials, Credentials};
 use librespot::core::cache::Cache;
-use librespot::core::config::{ConnectConfig, DeviceType, SessionConfig};
+use librespot::core::config::{ConnectConfig, DeviceType, SessionConfig, VolumeCtrl};
 use librespot::core::session::Session;
 use librespot::core::spotify_id::SpotifyId;
 
@@ -34,6 +34,7 @@ use librespot::playback::player::{Player, PlayerEvent};
 
 mod lms;
 use lms::LMS;
+mod oggdirect;
 
 const VERSION: &'static str = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"));
 
@@ -89,6 +90,7 @@ struct Setup {
     connect_config: ConnectConfig,
     credentials: Option<Credentials>,
     enable_discovery: bool,
+    pass_through: bool,
     zeroconf_port: u16,
 
     authenticate: bool,
@@ -135,6 +137,7 @@ fn setup(args: &[String]) -> Setup {
             "enable-volume-normalisation",
             "Play all tracks at the same volume",
         )
+        .optflag("", "pass-through", "Pass through == OGG-direct mode")
         .optopt("", "player-mac", "MAC address of the Squeezebox to be controlled", "MAC")
         .optopt("", "lms", "hostname and port of Logitech Media Server instance (eg. localhost:9000)", "LMS")
         .optopt("", "lms-auth", "Authentication data to access Logitech Media Server", "LMSAUTH")
@@ -168,6 +171,7 @@ fn setup(args: &[String]) -> Setup {
             "version": env!("CARGO_PKG_VERSION").to_string(),
             "lms-auth": true,
             "volume-normalisation": true,
+            "ogg-direct": true,
             "debug": DEBUGMODE,
             "save-token": true,
             "podcasts": true,
@@ -216,7 +220,7 @@ fn setup(args: &[String]) -> Setup {
     let authenticate = matches.opt_present("authenticate");
 
     let enable_discovery = !matches.opt_present("disable-discovery");
-
+    let pass_through = matches.opt_present("pass-through");
     let start_position = matches.opt_str("start-position")
         .unwrap_or("0".to_string())
         .parse::<f32>().unwrap_or(0.0);
@@ -245,7 +249,7 @@ fn setup(args: &[String]) -> Setup {
             bitrate: bitrate,
             normalisation: matches.opt_present("enable-volume-normalisation"),
             normalisation_pregain: PlayerConfig::default().normalisation_pregain,
-            lms_connect_mode: !matches.opt_present("single-track")
+			gapless: true
         }
     };
 
@@ -254,7 +258,7 @@ fn setup(args: &[String]) -> Setup {
             name: name,
             device_type: DeviceType::Speaker,
             volume: 0x8000 as u16,
-            linear_volume: true,
+			volume_ctrl: VolumeCtrl::Linear,
             autoplay: false
         }
     };
@@ -274,6 +278,7 @@ fn setup(args: &[String]) -> Setup {
         credentials: credentials,
         authenticate: authenticate,
         enable_discovery: enable_discovery,
+        pass_through: pass_through,
         zeroconf_port: zeroconf_port,
 
         get_token: matches.opt_present("get-token") || save_token.as_str().len() != 0,
@@ -401,9 +406,7 @@ impl Future for Main {
                 else {
                     self.connect = Box::new(futures::future::empty());
                     let mixer_config = MixerConfig {
-                        card: String::from("default"),
-                        mixer: String::from("PCM"),
-                        index: 0,
+                        ..MixerConfig::default()
                     };
 
                     let mixer = (mixer::find(Some("softvol")).unwrap())(Some(mixer_config));
@@ -413,11 +416,29 @@ impl Future for Main {
 
                     let audio_filter = mixer.get_audio_filter();
                     let backend = audio_backend::find(None).unwrap();
+
+                    /* 
+                      ToDo: fix Connect mode.
+                      The problem is that we're playing/downloading in librespot::playback::player very fast to the pipe backend with a null device.
+                      Thus the player's position is completely out-of-sync with the actual Squeezebox position (which uses a separate spotty process with single-track)
+                     
+                      Some ideas to fix this: 
+                      (1) mherger uses a customized librespot with some hacks to workaround. 
+                      (2) create a 'null' backend that reads at 44.1khz/16 bit from the stream. Perhaps with a leaky bucket approach: https://en.wikipedia.org/wiki/Leaky_bucket
+                          The Squeezebox would still be out-of-sync, but only a few seconds.
+                      (3) Pipe the player's PCM to stdout and let the LMS plugin suck from that pipe.
+                          That would loose LMS's cross-fading ability.
+                          Also needs decoding CPU time on the LMS-server.
+                      (4) Don't use librespot::playback - but use spirc with our own bridgedplayer.
+                    */
                     let device = Some(NULLDEVICE.to_string());
-                    let (player, event_channel) =
+                    let (player, _event_channel) =
                         Player::new(player_config, session.clone(), audio_filter, move || {
                             (backend)(device)
-                        });
+						});
+                        
+                    // ToDo: figure out why this enables to seek while using the _event_channel appears to don't.....
+					let event_channel = player.get_player_event_channel();
 
                     let (spirc, spirc_task) = Spirc::new(connect_config, session.clone(), player, mixer);
                     self.spirc = Some(spirc);
@@ -505,6 +526,7 @@ fn main() {
         credentials,
         authenticate,
         enable_discovery,
+        pass_through,
         zeroconf_port,
         get_token,
         save_token,
@@ -517,21 +539,28 @@ fn main() {
 
     if let Some(ref track_id) = single_track {
         match credentials {
-            Some(credentials) => {
-                let backend = audio_backend::find(None).unwrap();
-
-                let track = SpotifyId::from_uri(
-                                    track_id.replace("spotty://", "spotify:")
-                                    .replace("://", ":")
-                                    .as_str());
+            Some(credentials) => { 
+                let spotify_id = SpotifyId::from_uri(
+                    track_id.replace("spotty://", "spotify:")
+                    .replace("://", ":")
+                    .as_str()).unwrap();
 
                 let session = core.run(Session::connect(session_config.clone(), credentials, cache.clone(), handle)).unwrap();
 
-                let (player, _) = Player::new(player_config, session.clone(), None, move || (backend)(None));
+                if pass_through {
+                    oggdirect::download(core, session, spotify_id, player_config);
+                } else {
+                    // ToDo: refactor to play.rs and implement ctrl_c and read timeout handling.
+                    let backend = audio_backend::find(None).unwrap();
 
-                core.run(player.load(track.unwrap(), true, start_position)).unwrap();
+                    let (mut player, _) = Player::new(player_config, session.clone(), None, move || (backend)(None));
+
+                    player.load(spotify_id, true, start_position);
+                    
+                    core.run(player.get_end_of_track_future()).unwrap();
+                }
             }
-            None => {
+             None => {
                 println!("Missing credentials");
             }
         }
@@ -569,6 +598,7 @@ fn main() {
         }
     }
     else {
+        // ToDo: refactor into connect.rs
         core.run(Main::new(handle, Setup {
             cache,
             session_config,
@@ -577,6 +607,7 @@ fn main() {
             credentials,
             authenticate,
             enable_discovery,
+            pass_through,
             zeroconf_port,
             get_token,
             save_token,

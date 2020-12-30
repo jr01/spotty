@@ -46,28 +46,46 @@ impl LMS {
 				info!("change: spotify:track:{} -> spotify:track:{}", old_track_id.to_base62(), new_track_id.to_base62());
 				command = format!(r#"["spottyconnect","change","{}","{}"]"#, new_track_id.to_base62().to_string(), old_track_id.to_base62().to_string());
 			}
-			PlayerEvent::Started { track_id } => {
+			PlayerEvent::Started { play_request_id, track_id, position_ms } => {
 				#[cfg(debug_assertions)]
 				info!("play spotify:track:{}", track_id.to_base62());
 				command = format!(r#"["spottyconnect","start","{}"]"#, track_id.to_base62().to_string());
 			}
-			PlayerEvent::Stopped { track_id } => {
+			PlayerEvent::Stopped { play_request_id, track_id } => {
 				#[cfg(debug_assertions)]
 				info!("stop spotify:track:{}", track_id.to_base62());
 				command = r#"["spottyconnect","stop"]"#.to_string();
 			}
-			PlayerEvent::Volume { volume } => {
+			PlayerEvent::VolumeSet { volume } => {
 				#[cfg(debug_assertions)]
 				info!("volume {}", volume);
 				// we're not using the volume here, as LMS will read player state anyway
 				command = format!(r#"["spottyconnect","volume",{}]"#, volume.to_string());
 			}
-			PlayerEvent::Seek { position } => {
-				#[cfg(debug_assertions)]
-				info!("seek {}", position);
-				// we're not implementing the seek event here, as it's going to read player state anyway
-				command = r#"["spottyconnect","change"]"#.to_string();
+			// ToDo: do something useful with the events below.
+			PlayerEvent::Loading { play_request_id, track_id, position_ms } => {
+
 			}
+			PlayerEvent::Playing { play_request_id, track_id, position_ms, duration_ms } => {
+
+			}
+			PlayerEvent::Paused { play_request_id, track_id, position_ms, duration_ms } => {
+			}
+			PlayerEvent::TimeToPreloadNextTrack { play_request_id, track_id } => {
+
+			}
+			PlayerEvent::EndOfTrack { play_request_id, track_id } => {
+
+			}
+			PlayerEvent::Unavailable { play_request_id, track_id } => {
+
+			}
+			// PlayerEvent::Seek { position } => {
+			// 	#[cfg(debug_assertions)]
+			// 	info!("seek {}", position);
+			// 	// we're not implementing the seek event here, as it's going to read player state anyway
+			// 	command = r#"["spottyconnect","change"]"#.to_string();
+			// }
 		}
 
 		if !self.is_configured() {
