@@ -1,11 +1,24 @@
+use serde_json::Value;
+use sha1::{Digest, Sha1};
+
 use std::str::FromStr;
+
 use tokio_core::reactor::{Handle};
 
 use futures::Future;
+use futures::stream::Stream;
+
 use hyper::{Method, Request, Uri, Client};
 use hyper::header::{Authorization, ContentLength, ContentType};
 
-use librespot::playback::player::PlayerEvent;
+use serde::{Deserialize, Deserializer};
+use serde::de::{self, Unexpected};
+
+pub enum LMSEvent {
+	Stopped,
+	Playing { position_ms: u32, play_id: String },
+	Paused { position_ms: u32, play_id: String },
+}
 
 #[derive(Clone)]
 pub struct LMS {
@@ -34,60 +47,7 @@ impl LMS {
 		return false;
 	}
 
-	pub fn signal_event(&self, event: PlayerEvent, handle: Handle) {
-		let mut command = r#"["spottyconnect","change"]"#.to_string();
-
-		match event {
-			PlayerEvent::Changed {
-				old_track_id,
-				new_track_id,
-			} => {
-				#[cfg(debug_assertions)]
-				info!("change: spotify:track:{} -> spotify:track:{}", old_track_id.to_base62(), new_track_id.to_base62());
-				command = format!(r#"["spottyconnect","change","{}","{}"]"#, new_track_id.to_base62().to_string(), old_track_id.to_base62().to_string());
-			}
-			PlayerEvent::Started { play_request_id, track_id, position_ms } => {
-				#[cfg(debug_assertions)]
-				info!("play spotify:track:{}", track_id.to_base62());
-				command = format!(r#"["spottyconnect","start","{}"]"#, track_id.to_base62().to_string());
-			}
-			PlayerEvent::Stopped { play_request_id, track_id } => {
-				#[cfg(debug_assertions)]
-				info!("stop spotify:track:{}", track_id.to_base62());
-				command = r#"["spottyconnect","stop"]"#.to_string();
-			}
-			PlayerEvent::VolumeSet { volume } => {
-				#[cfg(debug_assertions)]
-				info!("volume {}", volume);
-				// we're not using the volume here, as LMS will read player state anyway
-				command = format!(r#"["spottyconnect","volume",{}]"#, volume.to_string());
-			}
-			// ToDo: do something useful with the events below.
-			PlayerEvent::Loading { play_request_id, track_id, position_ms } => {
-
-			}
-			PlayerEvent::Playing { play_request_id, track_id, position_ms, duration_ms } => {
-
-			}
-			PlayerEvent::Paused { play_request_id, track_id, position_ms, duration_ms } => {
-			}
-			PlayerEvent::TimeToPreloadNextTrack { play_request_id, track_id } => {
-
-			}
-			PlayerEvent::EndOfTrack { play_request_id, track_id } => {
-
-			}
-			PlayerEvent::Unavailable { play_request_id, track_id } => {
-
-			}
-			// PlayerEvent::Seek { position } => {
-			// 	#[cfg(debug_assertions)]
-			// 	info!("seek {}", position);
-			// 	// we're not implementing the seek event here, as it's going to read player state anyway
-			// 	command = r#"["spottyconnect","change"]"#.to_string();
-			// }
-		}
-
+	pub fn send_command(&self, handle: Handle, command: &str) {
 		if !self.is_configured() {
 			#[cfg(debug_assertions)]
 			info!("LMS connection is not configured");
@@ -126,4 +86,126 @@ impl LMS {
 			}
 		}
 	}
+
+	pub fn poll_state(&mut self, handle: Handle, lms_cmd_tx: futures::sync::mpsc::UnboundedSender<LMSEvent>) {
+		let client = Client::new(&handle);
+
+		let post_body = json!({
+			"id": 1,
+			"method": "slim.request",
+			"params": [
+				self.player_mac.clone(),
+				["status", "-", 1, "tags:gABbehldiqtyrSuoKLNu"]
+			]
+		});
+
+		if let Some(ref base_url) = self.base_url {
+			let uri = Uri::from_str(base_url).unwrap();
+			let mut req = Request::new(Method::Post, uri);
+
+			if let Some(ref auth) = self.auth {
+				req.headers_mut().set(Authorization(format!("Basic {}", auth).to_owned()));
+			}
+
+			req.headers_mut().set_raw("X-Scanner", "1");
+			req.headers_mut().set(ContentType::json());
+
+			let json_str = post_body.to_string();
+			req.headers_mut().set(ContentLength(json_str.len() as u64));
+			req.set_body(json_str);
+
+			let work = client
+				.request(req)
+				.and_then(|res| {
+					// asynchronously concatenate chunks of the body
+					res.body().concat2()
+				})
+				.and_then(move |body| {
+					match serde_json::from_slice::<PlayerStatus>(&body) {
+						Ok(player_status) => {
+							let position_ms: u32 = (player_status.result.time * 1000.0) as u32;
+												
+							if player_status.result.remote_meta["title"].to_string() != "null" {
+								// LMS doesn't have the track_id unfortunately - make one up.
+								let play_id =
+									format!("{}-{}-{}", 
+										player_status.result.remote_meta["artist"].to_string(),
+										player_status.result.remote_meta["album"].to_string(),
+										player_status.result.remote_meta["title"].to_string()
+									);
+								let play_id = hex::encode(Sha1::digest(play_id.as_bytes()));
+
+								match player_status.result.mode.as_str() {
+									"play" => lms_cmd_tx.unbounded_send(LMSEvent::Playing { position_ms: position_ms, play_id: play_id }).unwrap(),
+									"pause" => lms_cmd_tx.unbounded_send(LMSEvent::Paused { position_ms: position_ms, play_id: play_id }).unwrap(),
+									"stop" => lms_cmd_tx.unbounded_send(LMSEvent::Stopped).unwrap(),
+									&_ => {}
+								};
+							}
+						},
+						Err(_) => {
+							// ignore for now.
+						}
+					}
+												
+					
+					Ok(())
+				})
+				.map_err(|_| ());
+
+			handle.spawn(work);
+		}
+	}
+}
+
+
+
+#[derive(Deserialize, Debug)]
+pub struct PlayerStatus {
+	pub result: PlayerStatusResult,
+	pub id: u32, // 1
+	pub method: String // slim.request
+}
+#[derive(Deserialize, Debug)]
+pub struct PlayerStatusResult {
+	#[serde(deserialize_with = "bool_from_int")]
+	pub can_seek: bool,
+	pub current_title: String, // why is this empty???
+	pub digital_volume_control: u32, // 0 -> boolean???
+	pub mode: String, // "play", "stop", "pause"
+	#[serde(alias = "mixer volume")]
+	pub mixer_volume: u32,
+    #[serde(deserialize_with = "bool_from_int")]
+    pub player_connected: bool,
+    pub playlist_cur_index: String,
+    #[serde(alias = "playlist mode")]
+    pub playlist_mode: String, // "off"
+    #[serde(alias = "playlist repeat", deserialize_with = "bool_from_int")]
+    pub playlist_repeat: bool,
+    #[serde(alias = "playlist shuffle", deserialize_with = "bool_from_int")]
+    pub playlist_shuffle: bool,
+    pub playlist_timestamp: f64,
+    pub playlist_tracks: u32, // number of tracks in the playlist.
+    pub power: u32,
+    #[serde(deserialize_with = "bool_from_int")]
+    pub remote: bool, // 1
+    #[serde(alias = "remoteMeta")]
+    pub remote_meta: Value,
+    pub seq_no: String, // ????
+    pub signalstrength: u32, // 0
+    pub time: f64, // position.
+}
+
+fn bool_from_int<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match u8::deserialize(deserializer)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(de::Error::invalid_value(
+            Unexpected::Unsigned(other as u64),
+            &"zero or one",
+        )),
+    }
 }

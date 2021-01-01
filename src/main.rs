@@ -3,7 +3,6 @@
 #[macro_use]
 extern crate serde_json;
 
-use futures::sync::mpsc::UnboundedReceiver;
 use futures::{Async, Future, Poll, Stream};
 use sha1::{Digest, Sha1};
 
@@ -30,11 +29,12 @@ use librespot::connect::spirc::{Spirc, SpircTask};
 use librespot::playback::audio_backend::{self};
 use librespot::playback::config::{Bitrate, PlayerConfig};
 use librespot::playback::mixer::{self, MixerConfig};
-use librespot::playback::player::{Player, PlayerEvent};
+use librespot::playback::player::{Player};
 
 mod lms;
 use lms::LMS;
 mod oggdirect;
+mod alternate_player;
 
 const VERSION: &'static str = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"));
 
@@ -42,11 +42,6 @@ const VERSION: &'static str = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_
 const DEBUGMODE: bool = true;
 #[cfg(not(debug_assertions))]
 const DEBUGMODE: bool = false;
-
-#[cfg(target_os="windows")]
-const NULLDEVICE: &'static str = "NUL";
-#[cfg(not(target_os="windows"))]
-const NULLDEVICE: &'static str = "/dev/null";
 
 fn device_id(name: &str) -> String {
     hex::encode(Sha1::digest(name.as_bytes()))
@@ -296,7 +291,6 @@ fn setup(args: &[String]) -> Setup {
 
 struct Main {
     cache: Option<Cache>,
-    player_config: PlayerConfig,
     session_config: SessionConfig,
     connect_config: ConnectConfig,
     handle: Handle,
@@ -313,7 +307,6 @@ struct Main {
     auto_connect_times: Vec<Instant>,
     authenticate: bool,
 
-    player_event_channel: Option<UnboundedReceiver<PlayerEvent>>,
     lms: LMS
 }
 
@@ -323,7 +316,6 @@ impl Main {
             handle: handle.clone(),
             cache: setup.cache,
             session_config: setup.session_config,
-            player_config: setup.player_config,
             connect_config: setup.connect_config,
 
             connect: Box::new(futures::future::empty()),
@@ -336,7 +328,6 @@ impl Main {
             authenticate: setup.authenticate,
             signal: Box::new(tokio_signal::ctrl_c().flatten_stream()),
 
-            player_event_channel: None,
             lms: setup.lms
         };
 
@@ -411,39 +402,18 @@ impl Future for Main {
 
                     let mixer = (mixer::find(Some("softvol")).unwrap())(Some(mixer_config));
 
-                    let player_config = self.player_config.clone();
                     let connect_config = self.connect_config.clone();
 
-                    let audio_filter = mixer.get_audio_filter();
-                    let backend = audio_backend::find(None).unwrap();
-
-                    /* 
-                      ToDo: fix Connect mode.
-                      The problem is that we're playing/downloading in librespot::playback::player very fast to the pipe backend with a null device.
-                      Thus the player's position is completely out-of-sync with the actual Squeezebox position (which uses a separate spotty process with single-track)
-                     
-                      Some ideas to fix this: 
-                      (1) mherger uses a customized librespot with some hacks to workaround. 
-                      (2) create a 'null' backend that reads at 44.1khz/16 bit from the stream. Perhaps with a leaky bucket approach: https://en.wikipedia.org/wiki/Leaky_bucket
-                          The Squeezebox would still be out-of-sync, but only a few seconds.
-                      (3) Pipe the player's PCM to stdout and let the LMS plugin suck from that pipe.
-                          That would loose LMS's cross-fading ability.
-                          Also needs decoding CPU time on the LMS-server.
-                      (4) Don't use librespot::playback - but use spirc with our own bridgedplayer.
-                    */
-                    let device = Some(NULLDEVICE.to_string());
-                    let (player, _event_channel) =
-                        Player::new(player_config, session.clone(), audio_filter, move || {
-                            (backend)(device)
-						});
-                        
-                    // ToDo: figure out why this enables to seek while using the _event_channel appears to don't.....
-					let event_channel = player.get_player_event_channel();
+                    // **hack** Create our own alternative player and convert it into librespots player struct - https://blog.knoldus.com/safe-way-to-access-private-fields-in-rust/
+                    //          With minimal work in librespot this hack can be avoided.
+                    let alternate_player = alternate_player::Player::new(self.lms.clone(), self.handle.clone());
+                    let player: Player = unsafe {
+                        std::mem::transmute(alternate_player)
+                    };
 
                     let (spirc, spirc_task) = Spirc::new(connect_config, session.clone(), player, mixer);
                     self.spirc = Some(spirc);
                     self.spirc_task = Some(spirc_task);
-                    self.player_event_channel = Some(event_channel);
                 }
 
                 progress = true;
@@ -493,12 +463,6 @@ impl Future for Main {
                         self.auto_connect_times.push(Instant::now());
                         self.credentials(credentials);
                     }
-                }
-            }
-
-            if let Some(ref mut player_event_channel) = self.player_event_channel {
-                if let Async::Ready(Some(event)) = player_event_channel.poll().unwrap() {
-                    self.lms.signal_event(event, self.handle.clone());
                 }
             }
 
@@ -619,4 +583,3 @@ fn main() {
         })).unwrap()
     }
 }
-
